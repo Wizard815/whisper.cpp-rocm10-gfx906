@@ -8,16 +8,25 @@
 >   auto-loads `--model`, or `POST /load` (form field `model`, a server-side file path —
 >   this endpoint already existed upstream) picks a different one first.
 > - `POST /unload` — free the loaded model, back to zero GPU memory, server stays up.
+> - `--idle-timeout N` — auto-`/unload` after N idle seconds (independent of
+>   `--lazy-load`, which only covers startup). Idle time is measured from when the
+>   model last *finished* being used, not from when a request started — an earlier
+>   version got this backwards and unloaded a model immediately after a single slow
+>   (~40s, CPU) request completed, mistaking "just spent 40s working" for "idle 40s".
+>   Caught by actually exercising the timer, not just compiling; fixed with an RAII
+>   scope guard so the clock touches on every exit path, success and error alike.
 > - `GET /health` — now correctly reports `{"status":"unloaded"}` while nothing is
 >   loaded (previously any non-400/500 error status handlers set was getting silently
 >   rewritten into a generic 404 by the shared error handler — fixed as part of this,
 >   see `examples/server/server.cpp`).
 >
-> **Status:** compiles clean against the ROCm 10/gfx906 SDK, and the full
-> lazy-load → auto-load → unload → explicit-load cycle is verified working — but only
-> on CPU so far (no ROCm-capable GPU on the machine this was developed on). The actual
-> HIP/GPU inference path has **not yet been verified on real gfx906 hardware** — that's
-> the next thing to confirm before treating this as done.
+> **Status:** compiles clean against the ROCm 10/gfx906 SDK. The full lifecycle is
+> verified working end to end — lazy-load → auto-load → unload → explicit-load, and
+> separately idle-timeout not firing prematurely, firing correctly once actually idle,
+> and a second request resetting the clock rather than the timer being absolute since
+> first load — but only on **CPU** so far (no ROCm-capable GPU on the machine this was
+> developed on). The actual HIP/GPU inference path has **not yet been verified on real
+> gfx906 hardware** — that's the next thing to confirm before treating this as done.
 >
 > Build: `cmake -B build -DGGML_HIP=1 -DAMDGPU_TARGETS=gfx906 && cmake --build build --target whisper-server`
 > against `zenth815/rocm10-gfx906:sdk`.
