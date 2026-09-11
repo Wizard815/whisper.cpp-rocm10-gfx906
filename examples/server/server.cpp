@@ -68,6 +68,10 @@ struct server_params
     int32_t port          = 8080;
     int32_t read_timeout  = 600;
     int32_t write_timeout = 600;
+    int32_t idle_timeout  = 0; // seconds; 0 = disabled. Auto-/unload after this long
+                               // since the last /inference, independent of --lazy-load
+                               // (which only controls startup - this is the ongoing
+                               // "free it if nobody's using it" policy).
 
     bool ffmpeg_converter = false;
 };
@@ -173,6 +177,9 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "                                                   auto-loads it, or POST /load a different one first.\n");
     fprintf(stderr, "                                                   POST /unload frees the loaded model (router-mode style:\n");
     fprintf(stderr, "                                                   the server stays up with nothing resident until asked).\n");
+    fprintf(stderr, "             --idle-timeout N            [%-7d] auto-/unload after N seconds since the last /inference\n",   sparams.idle_timeout);
+    fprintf(stderr, "                                                   (0 = disabled). Independent of --lazy-load, which only\n");
+    fprintf(stderr, "                                                   covers startup - this is the ongoing idle policy.\n");
     fprintf(stderr, "  -oved D,   --ov-e-device DNAME         [%-7s] the OpenVINO device used for encode inference\n",  params.openvino_encode_device.c_str());
     // server params
     fprintf(stderr, "  -dtw MODEL --dtw MODEL                 [%-7s] compute token-level timestamps\n",                          params.dtw.c_str());
@@ -264,6 +271,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params, serve
         else if (                   arg == "--inference-path")  { sparams.inference_path = argv[++i]; }
         else if (                   arg == "--convert")         { sparams.ffmpeg_converter     = true; }
         else if (                   arg == "--tmp-dir")         { sparams.tmp_dir     = argv[++i]; }
+        else if (                   arg == "--idle-timeout")    { sparams.idle_timeout = std::stoi(argv[++i]); }
 
         // Voice Activity Detection (VAD)
         else if (                   arg == "--vad")                         { params.vad                         = true; }
@@ -732,6 +740,19 @@ int main(int argc, char ** argv) {
     std::unique_ptr<httplib::Server> svr = std::make_unique<httplib::Server>();
     std::atomic<server_state> state{SERVER_STATE_LOADING_MODEL};
 
+    // Seconds since epoch of the last /inference (successful or not - any use counts).
+    // Updated without holding whisper_mutex (it's just a liveness signal for the idle
+    // monitor thread below, not something that needs to be consistent with ctx).
+    std::atomic<int64_t> last_used{0};
+    auto touch_last_used = [&]() {
+        last_used.store(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    // Seed it now, not left at 0/epoch - otherwise a non-lazy startup (ctx already
+    // loaded) combined with --idle-timeout would look infinitely idle on the very
+    // first poll and unload immediately.
+    touch_last_used();
+
     struct whisper_context * ctx = nullptr;
 
     if (params.lazy_load) {
@@ -845,6 +866,15 @@ int main(int argc, char ** argv) {
     svr->Post(sparams.request_path + sparams.inference_path, [&](const Request &req, Response &res){
         // acquire whisper model mutex lock
         std::lock_guard<std::mutex> lock(whisper_mutex);
+        // "idle" means time since the model last FINISHED being used, not time
+        // since a request STARTED - a single slow (e.g. large-model CPU) request
+        // would otherwise look like N seconds of idle time the instant it
+        // completes, since the idle monitor blocks on this same mutex until we're
+        // done and would then see "started N seconds ago" as if that were idle
+        // time. A scope guard (rather than touch_last_used() calls before every
+        // return in this handler, error paths included) fires on every exit path.
+        struct ScopeExit { std::function<void()> fn; ~ScopeExit() { fn(); } };
+        ScopeExit touch_on_exit{touch_last_used};
 
         // router-mode: nothing loaded yet (either --lazy-load at startup, or a prior
         // /unload) - auto-load the default --model path, same as llama-server's
@@ -1212,6 +1242,11 @@ int main(int argc, char ** argv) {
     });
     svr->Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
         std::lock_guard<std::mutex> lock(whisper_mutex);
+        // Same reasoning as /inference: touch on exit, not entry, so idle time is
+        // measured from when loading FINISHED, not from when this request started
+        // (a large model load could itself take a while).
+        struct ScopeExit { std::function<void()> fn; ~ScopeExit() { fn(); } };
+        ScopeExit touch_on_exit{touch_last_used};
         state.store(SERVER_STATE_LOADING_MODEL);
         if (!req.has_file("model"))
         {
@@ -1364,7 +1399,34 @@ int main(int argc, char ** argv) {
 
     svr->wait_until_ready();
 
+    // Idle-unload monitor. Independent of --lazy-load (that's startup-only) - this
+    // is the ongoing "nobody's used it in --idle-timeout seconds, free it" policy.
+    // Polls every 5s rather than sleeping for the full timeout so a short-lived
+    // --idle-timeout doesn't leave the model resident noticeably longer than asked.
+    std::thread idle_monitor([&] {
+        if (sparams.idle_timeout <= 0) {
+            return;
+        }
+        while (svr->is_running()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            std::lock_guard<std::mutex> lock(whisper_mutex);
+            if (ctx == nullptr) {
+                continue;
+            }
+            const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (now - last_used.load() >= sparams.idle_timeout) {
+                fprintf(stderr, "idle for >=%ds, auto-unloading\n", sparams.idle_timeout);
+                whisper_print_timings(ctx);
+                whisper_free(ctx);
+                ctx = nullptr;
+                state.store(SERVER_STATE_UNLOADED);
+            }
+        }
+    });
+
     t.join();
+    idle_monitor.join();
 
 
     clean_up();
