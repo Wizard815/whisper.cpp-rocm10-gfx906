@@ -29,6 +29,9 @@ using json = nlohmann::ordered_json;
 enum server_state {
     SERVER_STATE_LOADING_MODEL,  // Server is starting up, model not fully loaded yet
     SERVER_STATE_READY,          // Server is ready and model is loaded
+    SERVER_STATE_UNLOADED,       // No model loaded (--lazy-load at startup, or after /unload) -
+                                  // the next /inference auto-loads --model; /load switches to
+                                  // any other model explicitly.
 };
 
 namespace {
@@ -109,6 +112,7 @@ struct whisper_params {
     bool no_context                = true;
     bool no_language_probabilities = false;
     bool carry_initial_prompt      = false;
+    bool lazy_load                 = false;
 
     std::string language               = "en";
     std::string prompt                 = "";
@@ -165,6 +169,10 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "             --prompt PROMPT             [%-7s] initial prompt\n",                                 params.prompt.c_str());
     fprintf(stderr, "             --carry-initial-prompt      [%-7s] always prepend initial prompt\n",                  params.carry_initial_prompt ? "true" : "false");
     fprintf(stderr, "  -m FNAME,  --model FNAME               [%-7s] model path\n",                                     params.model.c_str());
+    fprintf(stderr, "             --lazy-load                 [%-7s] don't load --model at startup; the first /inference\n",             params.lazy_load ? "true" : "false");
+    fprintf(stderr, "                                                   auto-loads it, or POST /load a different one first.\n");
+    fprintf(stderr, "                                                   POST /unload frees the loaded model (router-mode style:\n");
+    fprintf(stderr, "                                                   the server stays up with nothing resident until asked).\n");
     fprintf(stderr, "  -oved D,   --ov-e-device DNAME         [%-7s] the OpenVINO device used for encode inference\n",  params.openvino_encode_device.c_str());
     // server params
     fprintf(stderr, "  -dtw MODEL --dtw MODEL                 [%-7s] compute token-level timestamps\n",                          params.dtw.c_str());
@@ -236,6 +244,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params, serve
         else if (arg == "-dl"    || arg == "--detect-language")           { params.detect_language           = true; }
         else if (                   arg == "--prompt")                    { params.prompt                    = argv[++i]; }
         else if (                   arg == "--carry-initial-prompt")      { params.carry_initial_prompt      = true; }
+        else if (                   arg == "--lazy-load")                 { params.lazy_load                 = true; }
         else if (arg == "-m"     || arg == "--model")                     { params.model                     = argv[++i]; }
         else if (arg == "-oved"  || arg == "--ov-e-device")               { params.openvino_encode_device    = argv[++i]; }
         else if (arg == "-dtw"   || arg == "--dtw")                       { params.dtw                       = argv[++i]; }
@@ -723,16 +732,26 @@ int main(int argc, char ** argv) {
     std::unique_ptr<httplib::Server> svr = std::make_unique<httplib::Server>();
     std::atomic<server_state> state{SERVER_STATE_LOADING_MODEL};
 
-    struct whisper_context * ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
+    struct whisper_context * ctx = nullptr;
 
-    if (ctx == nullptr) {
-        fprintf(stderr, "error: failed to initialize whisper context\n");
-        return 3;
+    if (params.lazy_load) {
+        // Router-mode style: come up with nothing resident. The first /inference
+        // auto-loads --model (see below); POST /load picks a different one first.
+        state.store(SERVER_STATE_UNLOADED);
+        fprintf(stderr, "server started with --lazy-load: no model loaded yet, "
+                        "waiting for a request (default: '%s')\n", params.model.c_str());
+    } else {
+        ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
+
+        if (ctx == nullptr) {
+            fprintf(stderr, "error: failed to initialize whisper context\n");
+            return 3;
+        }
+
+        // initialize openvino encoder. this has no effect on whisper.cpp builds that don't have OpenVINO configured
+        whisper_ctx_init_openvino_encoder(ctx, nullptr, params.openvino_encode_device.c_str(), nullptr);
+        state.store(SERVER_STATE_READY);
     }
-
-    // initialize openvino encoder. this has no effect on whisper.cpp builds that don't have OpenVINO configured
-    whisper_ctx_init_openvino_encoder(ctx, nullptr, params.openvino_encode_device.c_str(), nullptr);
-    state.store(SERVER_STATE_READY);
 
 
     svr->set_default_headers({{"Server", "whisper.cpp"},
@@ -826,6 +845,25 @@ int main(int argc, char ** argv) {
     svr->Post(sparams.request_path + sparams.inference_path, [&](const Request &req, Response &res){
         // acquire whisper model mutex lock
         std::lock_guard<std::mutex> lock(whisper_mutex);
+
+        // router-mode: nothing loaded yet (either --lazy-load at startup, or a prior
+        // /unload) - auto-load the default --model path, same as llama-server's
+        // on-demand model loading. POST /load first if you want a different model.
+        if (ctx == nullptr) {
+            state.store(SERVER_STATE_LOADING_MODEL);
+            fprintf(stderr, "no model loaded, auto-loading default '%s' ...\n", default_params.model.c_str());
+            ctx = whisper_init_from_file_with_params(default_params.model.c_str(), cparams);
+            if (ctx == nullptr) {
+                state.store(SERVER_STATE_UNLOADED);
+                fprintf(stderr, "error: auto-load of '%s' failed\n", default_params.model.c_str());
+                const std::string error_resp = "{\"error\":\"no model loaded and auto-load failed - POST /load first\"}";
+                res.status = 503;
+                res.set_content(error_resp, "application/json");
+                return;
+            }
+            whisper_ctx_init_openvino_encoder(ctx, nullptr, default_params.openvino_encode_device.c_str(), nullptr);
+            state.store(SERVER_STATE_READY);
+        }
 
         // first check user requested fields of the request
         if (!req.has_file("file"))
@@ -1215,11 +1253,25 @@ int main(int argc, char ** argv) {
         // check if the model is in the file system
     });
 
+    svr->Post(sparams.request_path + "/unload", [&](const Request &, Response &res){
+        std::lock_guard<std::mutex> lock(whisper_mutex);
+        if (ctx != nullptr) {
+            whisper_print_timings(ctx);
+            whisper_free(ctx);
+            ctx = nullptr;
+        }
+        state.store(SERVER_STATE_UNLOADED);
+        res.set_content("{\"status\":\"unloaded\"}", "application/json");
+    });
+
     svr->Get(sparams.request_path + "/health", [&](const Request &, Response &res){
         server_state current_state = state.load();
         if (current_state == SERVER_STATE_READY) {
             const std::string health_response = "{\"status\":\"ok\"}";
             res.set_content(health_response, "application/json");
+        } else if (current_state == SERVER_STATE_UNLOADED) {
+            res.set_content("{\"status\":\"unloaded\"}", "application/json");
+            res.status = 503;
         } else {
             res.set_content("{\"status\":\"loading model\"}", "application/json");
             res.status = 503;
@@ -1241,6 +1293,15 @@ int main(int argc, char ** argv) {
     });
 
     svr->set_error_handler([](const Request &req, Response &res) {
+        // Only paper over a TRULY unhandled route/status (no body set) - a handler
+        // that deliberately returned an error status WITH content (e.g. /health's
+        // 503 "loading"/"unloaded" JSON) must not be clobbered into a generic 404.
+        // This was a latent bug even before the /unload feature: the original
+        // "loading model" 503 case already hit it, just during a startup window
+        // brief enough that essentially nobody ever curled /health during it.
+        if (!res.body.empty()) {
+            return;
+        }
         if (res.status == 400) {
             res.set_content("Invalid request", "text/plain");
         } else if (res.status != 500) {
@@ -1289,8 +1350,10 @@ int main(int argc, char ** argv) {
 
     // clean up function, to be called before exit
     auto clean_up = [&]() {
-        whisper_print_timings(ctx);
-        whisper_free(ctx);
+        if (ctx != nullptr) {
+            whisper_print_timings(ctx);
+            whisper_free(ctx);
+        }
     };
 
     std::thread t([&] {

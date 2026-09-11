@@ -1,4 +1,26 @@
-# whisper.cpp
+# whisper.cpp (gfx906 / ROCm 10 fork — **WORK IN PROGRESS**)
+
+> **This is a fork.** It targets AMD `gfx906` (Instinct MI50/MI60, Radeon VII) against a
+> custom ROCm 10 build ([Wizard815/TheRock-gfx906](https://github.com/Wizard815/TheRock-gfx906)),
+> and adds a native, llama-server-style model lifecycle to `whisper-server`:
+>
+> - `--lazy-load` — start with **no model resident**; the first `/inference` request
+>   auto-loads `--model`, or `POST /load` (form field `model`, a server-side file path —
+>   this endpoint already existed upstream) picks a different one first.
+> - `POST /unload` — free the loaded model, back to zero GPU memory, server stays up.
+> - `GET /health` — now correctly reports `{"status":"unloaded"}` while nothing is
+>   loaded (previously any non-400/500 error status handlers set was getting silently
+>   rewritten into a generic 404 by the shared error handler — fixed as part of this,
+>   see `examples/server/server.cpp`).
+>
+> **Status:** compiles clean against the ROCm 10/gfx906 SDK, and the full
+> lazy-load → auto-load → unload → explicit-load cycle is verified working — but only
+> on CPU so far (no ROCm-capable GPU on the machine this was developed on). The actual
+> HIP/GPU inference path has **not yet been verified on real gfx906 hardware** — that's
+> the next thing to confirm before treating this as done.
+>
+> Build: `cmake -B build -DGGML_HIP=1 -DAMDGPU_TARGETS=gfx906 && cmake --build build --target whisper-server`
+> against `zenth815/rocm10-gfx906:sdk`.
 
 <div align="center">
 
