@@ -121,6 +121,18 @@ if (NOT GGML_CUDA_FA)
     add_compile_definitions(GGML_CUDA_NO_FA)
 endif()
 
+# gfx906 fork: default the AMDGPU machine scheduler to max-ilp for gfx906 builds
+# (recommended by the gfx906 llama.cpp forks; see mx-llama.cpp-Rocm10's
+# GFX906-ROCM10.md). Skipped if the user already chose a strategy in
+# CMAKE_HIP_FLAGS, since an LLVM cl::opt may only be given once.
+option(GGML_HIP_GFX906_MAX_ILP "ggml: use -amdgpu-sched-strategy=max-ilp when targeting gfx906" ON)
+if (GGML_HIP_GFX906_MAX_ILP AND NOT CXX_IS_HIPCC
+        AND "${CMAKE_HIP_ARCHITECTURES}" MATCHES "gfx906"
+        AND NOT "${CMAKE_HIP_FLAGS}" MATCHES "amdgpu-sched-strategy")
+    message(STATUS "gfx906: adding -mllvm -amdgpu-sched-strategy=max-ilp to HIP flags")
+    target_compile_options(ggml-hip PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-mllvm -amdgpu-sched-strategy=max-ilp>")
+endif()
+
 if (CXX_IS_HIPCC)
     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE CXX)
     if (WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")

@@ -30,6 +30,35 @@
 >
 > Build: `cmake -B build -DGGML_HIP=1 -DAMDGPU_TARGETS=gfx906 && cmake --build build --target whisper-server`
 > against `zenth815/rocm10-gfx906:sdk`.
+>
+> **gfx906 notes (Oct 2026 update):**
+>
+> - Merged upstream `ggml-org/whisper.cpp` master at `231638a`. The merge had no conflicts, and
+>   upstream didn't touch `examples/server/server.cpp`, so the lifecycle features above are unchanged.
+>   The vendored ggml now includes upstream's wave64 GCN MMQ table
+>   (`ggml/src/ggml-cuda/mmq-config-gcn.cuh`, llama.cpp PR #27841), which gfx906 already uses for
+>   quantized models. Its Q8_0 tiles go up to J=128.
+> - When `gfx906` is in the HIP target list, `-mllvm -amdgpu-sched-strategy=max-ilp` is now added to
+>   the HIP compile flags automatically. This is the scheduler flag the gfx906 llama.cpp forks recommend.
+>   It is skipped if `CMAKE_HIP_FLAGS` already sets an `amdgpu-sched-strategy`, and you can turn it off
+>   with `-DGGML_HIP_GFX906_MAX_ILP=OFF`. Builds for other GPUs are not affected. It has **not been
+>   benchmarked on whisper workloads** yet.
+> - Not ported from the sibling llama.cpp gfx906 fork, and why:
+>   - Custom gfx906 SGEMM: it only runs for 2D F32×F32 matmuls. Whisper weights and the KV cache are
+>     F16 or quantized, attention is batched over heads, and the encoder uses flash-attn by default, so
+>     it would essentially never be used.
+>   - gfx906 MMQ override table: its Q8_0 tuning is already in upstream's GCN table, MXFP4 isn't used by
+>     whisper models, and its Q5_K J=64 entry was measured against an older GCN-table entry that
+>     upstream has since retuned.
+>   - Q8_0 MMQ `#pragma unroll 2`: tried and reverted. With this ggml version's tile table, the
+>     compiler resource report shows new register spills (scratch 20–32 bytes per lane) for Q8_0 at J=32
+>     and J=128, both with and without max-ilp. J=128 is the tile the encoder uses with its 1500-column
+>     batch.
+>   - RoPE, turbo KV cache, GCN weight repack and the SOLVE_TRI fix: they target llama-architecture or
+>     linear-attention models, so whisper never calls them.
+> - Status: the gfx906 HIP build of `whisper-server` and `whisper-cli` compiles with ROCm 10.1. A CPU
+>   fallback smoke test of the server lifecycle passes. GPU inference and performance are still
+>   **not verified on real gfx906 hardware**.
 
 <div align="center">
 
