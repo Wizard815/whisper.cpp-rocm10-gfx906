@@ -31,6 +31,21 @@
 > Build: `cmake -B build -DGGML_HIP=1 -DAMDGPU_TARGETS=gfx906 && cmake --build build --target whisper-server`
 > against `zenth815/rocm10-gfx906:sdk`.
 >
+> **gfx906 notes (Nov 2026 update):**
+>
+> - Merged upstream `ggml-org/whisper.cpp` master at `092fa109` (331 commits). No conflicts; the
+>   lifecycle features and the max-ilp default carry over unchanged.
+> - Upstream ggml changes that matter here: ROCm/HIP now uses one fixed rocBLAS workspace instead of
+>   rocBLAS allocating one per call (llama/31838), which affects the F16 GEMM path the encoder uses;
+>   `rms_norm` got float4 load variants (llama/29720); the MMQ code was reorganized (`mmq-few.cu`,
+>   `mmq-load-tiles.cuh`). Nothing in it drops or special-cases away gfx906, and the
+>   `__gfx906__` dp4a paths are still there. New MFMA/WMMA work (CDNA lightning indexer, RDNA4_M) does
+>   not apply to gfx906.
+> - Upstream requires ROCm/HIP 6.1 or newer for `GGML_HIP`.
+> - Status: the gfx906 HIP build of `whisper-server` and `whisper-cli` compiles cleanly (0 warnings)
+>   with ROCm 7.1 (Ubuntu 26.04 packages) and the max-ilp flag applied. Not yet rebuilt against the
+>   ROCm 10 SDK image or run on real gfx906 hardware.
+>
 > **gfx906 notes (Oct 2026 update):**
 >
 > - Merged upstream `ggml-org/whisper.cpp` master at `231638a`. The merge had no conflicts, and
