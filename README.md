@@ -31,6 +31,21 @@
 > Build: `cmake -B build -DGGML_HIP=1 -DAMDGPU_TARGETS=gfx906 && cmake --build build --target whisper-server`
 > against `zenth815/rocm10-gfx906:sdk`.
 >
+> **gfx906 notes (Nov 2026 update):**
+>
+> - Merged upstream `ggml-org/whisper.cpp` master at `092fa109` (331 commits). No conflicts; the
+>   lifecycle features and the max-ilp default carry over unchanged.
+> - Upstream ggml changes that matter here: ROCm/HIP now uses one fixed rocBLAS workspace instead of
+>   rocBLAS allocating one per call (llama/31838), which affects the F16 GEMM path the encoder uses;
+>   `rms_norm` got float4 load variants (llama/29720); the MMQ code was reorganized (`mmq-few.cu`,
+>   `mmq-load-tiles.cuh`). Nothing in it drops or special-cases away gfx906, and the
+>   `__gfx906__` dp4a paths are still there. New MFMA/WMMA work (CDNA lightning indexer, RDNA4_M) does
+>   not apply to gfx906.
+> - Upstream requires ROCm/HIP 6.1 or newer for `GGML_HIP`.
+> - Status: the gfx906 HIP build of `whisper-server` and `whisper-cli` compiles cleanly (0 warnings)
+>   with ROCm 7.1 (Ubuntu 26.04 packages) and the max-ilp flag applied. Not yet rebuilt against the
+>   ROCm 10 SDK image or run on real gfx906 hardware.
+>
 > **gfx906 notes (Oct 2026 update):**
 >
 > - Merged upstream `ggml-org/whisper.cpp` master at `231638a`. The merge had no conflicts, and
@@ -87,7 +102,7 @@ High-performance inference of [OpenAI's Whisper](https://github.com/openai/whisp
 - [AMD ROCm GPU support](#amd-rocm-gpu-support)
 - [AMD Ryzen AI NPU Support](#amd-ryzen-ai-npu-support)
 - [OpenVINO Support](#openvino-support)
-- [Ascend NPU Support](#ascend-npu-support)
+- [Huawei Ascend NPU Support](#huawei-ascend-npu-support)
 - [Moore Threads GPU Support](#moore-threads-gpu-support)
 - [C-style API](https://github.com/ggml-org/whisper.cpp/blob/master/include/whisper.h)
 - [Voice Activity Detection (VAD)](#voice-activity-detection-vad)
@@ -544,14 +559,14 @@ cmake -B build -DGGML_BLAS=1
 cmake --build build -j --config Release
 ```
 
-## Ascend NPU support
+## Huawei Ascend NPU support
 
-Ascend NPU provides inference acceleration via [`CANN`](https://www.hiascend.com/en/software/cann) and AI cores.
+Huawei Ascend NPU provides inference acceleration via [`CANN`](https://www.hiascend.com/en/software/cann) and AI cores.
 
-First, check if your Ascend NPU device is supported:
+First, check if your Huawei Ascend NPU device is supported:
 
 **Verified devices**
-| Ascend NPU                    | Status  |
+| Huawei Ascend NPU             | Status  |
 |:-----------------------------:|:-------:|
 | Atlas 300T A2                 | Support |
 | Atlas 300I Duo                | Support |
@@ -573,8 +588,8 @@ Run the inference examples as usual, for example:
 
 *Notes:*
 
-- If you have trouble with Ascend NPU device, please create a issue with **[CANN]** prefix/tag.
-- If you run successfully with your Ascend NPU device, please help update the table `Verified devices`.
+- If you have trouble with Huawei Ascend NPU device, please create a issue with **[CANN]** prefix/tag.
+- If you run successfully with your Huawei Ascend NPU device, please help update the table `Verified devices`.
 
 ## Moore Threads GPU support
 
